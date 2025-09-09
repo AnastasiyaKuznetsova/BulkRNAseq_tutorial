@@ -1,0 +1,344 @@
+---
+title: "Limma Voom tutorial"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+This is an Rmarkdown notebook for Limma-Voom tutorial. The official version of this tutorial is here: <https://bioconductor.org/packages/release/workflows/vignettes/RNAseq123/inst/doc/limmaWorkflow.html>
+
+When you execute code within the notebook, the results appear beneath the code.Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*.
+
+# 1. Libraries import
+
+```{r}
+library(limma)
+library(Glimma)
+library(edgeR)
+library(Mus.musculus)
+library(RColorBrewer)
+
+```
+
+# 2. Data packaging
+
+## 2.1 Download data
+
+To get started with this analysis, download the file GSE63310_RAW.tar available online from <https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE63310&format=file>, and extract the relevant files from this archive. The code below will do this, or you can do this step manually and then move on.
+
+```{r}
+url <- "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE63310&format=file"
+utils::download.file(url, destfile="GSE63310_RAW.tar", mode="wb") 
+utils::untar("GSE63310_RAW.tar", exdir = ".")
+files <- c("GSM1545535_10_6_5_11.txt", "GSM1545536_9_6_5_11.txt", "GSM1545538_purep53.txt",
+           "GSM1545539_JMS8-2.txt", "GSM1545540_JMS8-3.txt", "GSM1545541_JMS8-4.txt",
+           "GSM1545542_JMS8-5.txt", "GSM1545544_JMS9-P7c.txt", "GSM1545545_JMS9-P8c.txt")
+
+for(i in paste(files, ".gz", sep=""))
+  # decompress each file
+  R.utils::gunzip(i, overwrite=TRUE)
+```
+
+Each of these text files contains the raw gene-level counts for a given sample. Note that our analysis only includes the basal, LP and ML samples from this experiment (see associated file names below).
+
+```{r}
+files <- c("GSM1545535_10_6_5_11.txt", "GSM1545536_9_6_5_11.txt", 
+           "GSM1545538_purep53.txt", "GSM1545539_JMS8-2.txt", 
+           "GSM1545540_JMS8-3.txt", "GSM1545541_JMS8-4.txt", 
+           "GSM1545542_JMS8-5.txt", "GSM1545544_JMS9-P7c.txt", 
+           "GSM1545545_JMS9-P8c.txt")
+read.delim(files[1], nrow=5)
+```
+
+Whilst each of the nine text files can be read into R separately and combined into a matrix of counts, edgeR offers a convenient way to do this in one step using the readDGE function.
+
+```{r}
+x <- readDGE(files, columns=c(1,3))
+print(class(x))
+print(dim(x))
+```
+
+## 2.2 Organize sample information
+
+For downstream analysis, sample-level information related to the experimental design needs to be associated with the columns of the counts matrix. In R, the function substring() is used to extract or replace parts of a character string.\
+text: the input character vector (can be a string or multiple strings).\
+first: the starting position (1-based index)
+
+```{r}
+colnames(x)
+samplenames <- substring(colnames(x), 12, nchar(colnames(x)))
+samplenames
+```
+
+```{r}
+colnames(x) <- samplenames
+group <- as.factor(c("LP", "ML", "Basal", "Basal", "ML", "LP", 
+                     "Basal", "ML", "LP"))
+x$samples$group <- group
+lane <- as.factor(rep(c("L004","L006","L008"), c(3,4,2)))
+x$samples$lane <- lane
+x$samples
+```
+
+# 2.3 Organising gene annotations
+
+```{r}
+geneid <- rownames(x)
+geneid
+```
+
+```{r}
+genes <- select(Mus.musculus, keys=geneid, columns=c("SYMBOL", "TXCHROM"), 
+                keytype="ENTREZID")
+head(genes)
+```
+
+As with any gene ID, Entrez gene IDs may not map one-to-one to the gene information of interest. Our gene annotation contains 28 genes that map to multiple chromosomes (e.g. gene Gm1987 is associated with chr4 and chr4_JH584294_random and microRNA Mir5098 is associated with chr2, chr5, chr8, chr11 and chr17). To resolve duplicate gene IDs one could select one of the chromosomes to represent the gene with duplicate annotation.
+
+```{r}
+
+genes <- genes[!duplicated(genes$ENTREZID),]
+x$genes <- genes
+```
+
+# 3. Data preprocessing
+
+## 3.1 Library normalization or **How to normalize RNA-seq data within a sample**
+
+### 3.1.1 Why normalize?
+
+If Sample A has 10 million reads and Sample B has 20 million reads, all gene counts in B will look about 2× higher just because of sequencing depth. Without correction, you might falsely conclude “everything is up-regulated” in B.
+
+### 3.1.2 What is a read and what is a count?
+
+In RNA-seq (or DNA-seq), sequencing machines don’t read entire transcripts or chromosomes at once. Instead, they generate short fragments of sequence (\~50-250bp per fragment). Each fragment is called a read.
+
+After sequencing, we use an aligner (like STAR, HISAT2, or kallisto) to map each read back to a reference genome or transcriptome. If a read overlaps with the exons of a particular gene, that read is counted towards that gene. The raw count for a gene is simply the number of reads mapped to that gene across all its exons.
+
+These counts depend on:\
+\* Gene expression level (more transcripts → more reads).\
+\* Gene length (longer genes attract more reads).\
+\* Sequencing depth (more reads in the sample → more counts per gene).
+
+### 3.1.3 The CPM (Counts Per Million) for gene *i* in sample *j* is:
+
+$$
+\text{CPM}_{ij} = \frac{\text{counts}_{ij}}{\sum_{k=1}^{G} \text{counts}_{kj}} \times 10^6
+$$
+
+Where: - $\text{counts}_{ij}$ = raw read counts for gene *i* in sample *j*\
+- $\sum_{k=1}^{G} \text{counts}_{kj}$ = total number of mapped reads in sample *j*\
+- $10^6$ = scaling factor to get counts per million
+
+### 3.1.4 Statistical tests like data that is close to normal distribuiton - logCPM
+
+The log-CPM transformation can be written as:
+
+$$
+\log_{2}\!\left(\text{CPM} + \frac{2}{L}\right)
+$$
+
+Where: - $\text{CPM}$ = counts per million for a given gene\
+- $L$ = library size (total number of reads mapped in the sample, usually in millions)
+
+### 3.1.5 Gene length normalization
+
+```         
+•   RPKM (Reads Per Kilobase per Million) and TPM (Transcripts Per Million):
+•   RPKM: adjusts for sequencing depth and gene length.
+•   TPM: similar, but normalizes across genes so values are comparable between samples.
+```
+
+### 3.1.5.1 RPKM (Reads Per Kilobase per Million)
+
+$$
+\text{RPKM}{i} = \frac{\text{raw counts}_{i} \times 10^9}{\text{total mapped reads} \times \text{gene length}_{i}}
+$$
+
+• $\text{raw counts}{i}$ = reads mapped to gene i\
+• $\text{total mapped reads}$ = sum of all counts in the sample\
+• $\text{gene length }{i}$ = length of gene i in base pairs (bp)
+
+⸻
+
+### 3.1.5.2 TPM (Transcripts Per Million)
+
+$$
+\text{TPM}{i} = \frac{\frac{\text{raw counts}_{i}}{\text{gene length}_{i}}}{\sum{j=1}^{N} \frac{\text{raw counts}_{j}}{\text{gene length}_{j}}} \times 10^6
+$$
+
+$$
+\frac{\text{raw counts}_i}{\text{gene length}_i} = \text{reads per base for gene i}
+$$ Denominator = sum of reads per base across all genes. Then scaled so that the sum of TPMs across genes = 1,000,000
+
+For the sake of simplicity and consistency we will do logCPM normalization.
+
+```{r}
+lcpm <- cpm(x, log=TRUE)
+
+L <- mean(x$samples$lib.size) * 1e-6
+M <- median(x$samples$lib.size) * 1e-6
+c(L, M)
+```
+
+## 3.2 Removing genes that are lowly expressed
+
+The filtering keeps genes that have count-per-million (CPM) above k in n samples, where k is determined by min.count and by the sample library sizes and n is determined by the design matrix.
+
+```{r}
+print("Before filtering")
+print(dim(x))
+keep.exprs <- filterByExpr(x, group=group)
+x <- x[keep.exprs,, keep.lib.sizes=FALSE]
+print("After filtering")
+dim(x)
+```
+
+## 3.3 Normalising gene expression distributions or **How to normalize RNA-seq data within a dataset (between samples)**
+
+During the sample preparation or sequencing process, external factors that are not of biological interest can affect the expression of individual samples. For example, samples processed in the first batch of an experiment can have higher expression overall when compared to samples processed in a second batch. It is assumed that all samples should have a similar range and distribution of expression values. Normalisation is required to ensure that the expression distributions of each sample are similar across the entire experiment.
+
+Normalisation by the method of trimmed mean of M-values (TMM) (Robinson and Oshlack 2010) is performed using the calcNormFactors function in edgeR.
+
+<https://genomebiology.biomedcentral.com/articles/10.1186/gb-2010-11-3-r25>
+
+```{r}
+x <- calcNormFactors(x, method = "TMM")
+x$samples$norm.factors
+```
+
+## 3.4 Dimensionality reduction
+
+Multi-dimensional scaling (MDS) plot shows similarities and dissimilarities between samples in an unsupervised manner so that one can have an idea of the extent to which differential expression can be detected before carrying out formal tests.
+
+```{r}
+library(RColorBrewer) 
+par(mfrow=c(1,2))
+col.group <- group
+levels(col.group) <-  brewer.pal(nlevels(col.group), "Set1")
+col.group <- as.character(col.group)
+col.lane <- lane
+levels(col.lane) <-  brewer.pal(nlevels(col.lane), "Set2")
+col.lane <- as.character(col.lane)
+plotMDS(lcpm, labels=group, col=col.group)
+title(main="A. Sample groups")
+plotMDS(lcpm, labels=lane, col=col.lane, dim=c(3,4))
+title(main="B. Sequencing lanes")
+```
+
+# 4. Differential expression analysis
+
+## 4.1 Creating a design matrix and contrasts
+
+In this study, it is of interest to see which genes are expressed at different levels between the three cell populations profiled. In our analysis, linear models are fitted to the data with the assumption that the underlying data is normally distributed. To get started, a design matrix is set up with both the cell population and sequencing lane (batch) information.
+
+```{r}
+design <- model.matrix(~0+group+lane)
+colnames(design) <- gsub("group", "", colnames(design))
+design
+```
+
+For example, \~0+group+lane removes the intercept from the first factor, group, but an intercept remains in the second factor lane. Alternatively, \~group+lane could be used to keep the intercepts in both group and lane. Understanding how to interpret the coefficients estimated in a given model is key here. We choose the first model for our analysis, as setting up model contrasts is more straight forward in the absence of an intercept for group. Contrasts for pairwise comparisons between cell populations are set up in limma using the makeContrasts function.
+
+```{r}
+ contr.matrix <- makeContrasts(
+   BasalvsLP = Basal-LP, 
+   BasalvsML = Basal - ML, 
+   LPvsML = LP - ML, 
+   levels = colnames(design))
+contr.matrix
+```
+
+## 4.2 **Removing heteroscedascity from count data**
+
+We need to remove **heteroscedasticity** (unequal variance) from count data because it violates the statistical assumptions of many downstream analyses and can distort biological interpretation. 
+
+### **Variance depends on mean in count data**
+
+In RNA-seq or other sequencing counts, genes with high expression naturally have much larger variance than low-expressed genes. This mean–variance relationship (heteroscedasticity) makes it hard to directly compare genes or samples, since differences in variance could be mistaken for differences in biology.
+
+`voom` converts raw counts to log-CPM values by automatically extracting library sizes and normalisation factors from `x` itself. Additional normalisation to log-CPM values can be specified within `voom` using the `normalize.method` argument.
+
+```{r}
+par(mfrow=c(1,2))
+# This function is intended to process RNA-Seq or ChIP-Seq data prior to linear modelling in limma.
+v <- voom(x, design, plot=TRUE)
+
+# Fit linear model for each gene given a series of arrays
+vfit <- lmFit(v, design)
+# Given a linear model fit, compute estimated coefficients and standard errors for a given set of contrasts.
+vfit <- contrasts.fit(vfit, contrasts=contr.matrix)
+# Given a linear model fit, compute moderated t-statistics, moderated F-statistic, and log-odds of differential expression by empirical Bayes moderation of the standard errors towards a common value.
+efit <- eBayes(vfit)
+plotSA(efit, main="Final model: Mean-variance trend")
+```
+
+What is voom doing?
+
+1.  Counts are transformed to log2 counts per million reads (CPM), where “per million reads” is defined based on the normalization factors we calculated earlier
+
+2.  A linear model is fitted to the log2 CPM for each gene, and the residuals are calculated
+
+3.  A smoothed curve is fitted to the sqrt(residual standard deviation) by average expression (see red line in plot above)
+
+4.  The smoothed curve is used to obtain weights for each gene and sample that are passed into limma along with the log2 CPMs.
+
+More details at <https://genomebiology.biomedcentral.com/articles/10.1186/gb-2014-15-2-r29>
+
+The above is a “good” voom plot.
+
+## 4.3 **Examining the number of DE genes**
+
+For a quick look at differential expression levels, the number of significantly up- and down-regulated genes can be summarised in a table. Significance is defined using an adjusted *p*-value cutoff that is set at 5% by default. For the comparison between expression levels in basal and LP, 4,648 genes are found to be down-regulated in basal relative to LP and 4,863 genes are up-regulated in basal relative to LP – a total of 9,511 DE genes.
+
+```{r}
+summary(decideTests(efit))
+```
+
+Some studies require more than an adjusted *p*-value cut-off. For a stricter definition on significance, one may require log-fold-changes (log-FCs) to be above a minimum value. The *treat* method (McCarthy and Smyth [2009](https://bioconductor.org/packages/release/workflows/vignettes/RNAseq123/inst/doc/limmaWorkflow.html#ref-McCarthy:Bioinf:2009)) can be used to calculate *p*-values from empirical Bayes moderated *t*-statistics with a minimum log-FC requirement.
+
+```{r}
+tfit <- treat(vfit, lfc=1)
+dt <- decideTests(tfit)
+summary(dt)
+```
+
+```{r}
+write.fit(tfit, dt, file="results.txt")
+```
+
+## 4.4 Examining individual DE genes from top to bottom
+
+```{r}
+basal.vs.lp <- topTreat(tfit, coef=1, n=Inf)
+basal.vs.ml <- topTreat(tfit, coef=2, n=Inf)
+head(basal.vs.lp)
+```
+
+## 4.5 Useful graphical representations of differential expression results
+
+Differentially expressed proteins (DEP) were visualized using the package EnhancedVolcano (version 1.11.5) in R. We included proteins that reached the threshold of adjusted p-value \<0.05 and log2 fold change ±0.40
+
+```{r}
+library(EnhancedVolcano)
+EnhancedVolcano(basal.vs.lp, x='logFC', y='adj.P.Val', lab=basal.vs.lp$SYMBOL, pCutoff = 0.05, FCcutoff=1,# legendPosition = 'right',
+                gridlines.major = FALSE,
+                gridlines.minor = FALSE)
+```
+
+```{r}
+
+basal.vs.lp
+```
+
+```{r}
+library(gplots)
+basal.vs.lp.topgenes <- basal.vs.lp$ENTREZID[1:100]
+i <- which(v$genes$ENTREZID %in% basal.vs.lp.topgenes)
+mycol <- colorpanel(1000,"blue","white","red")
+
+heatmap.2(lcpm[i,], scale="row",
+   labRow=v$genes$SYMBOL[i], labCol=group, 
+   col=mycol, trace="none", density.info="none", 
+   margin=c(8,6), lhei=c(2,10), dendrogram="column")
+```
